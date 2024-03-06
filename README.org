@@ -1,0 +1,82 @@
+#+title: MPRIS.el
+#+author: tecosaur
+
+Query and control media players over DBus with MPRIS (Media Player Remote
+Interface Specification).
+
+By watching DBus signals, this library operates in an event-driven manner, where
+basic information (the current player, playback status, current track metadata)
+is updated live.
+
+The API is written primarily for asynchronous usage, via the use of callback
+functions. It can also be used synchronously (by omitting the callback function
+argument), but with some trade-offs.
+
+* Querying player state
+
+The following functions can be used for querying the state of a media player:
++ ~mpris-get-playback-status~
++ ~mpris-get-metadata~
++ ~mpris-get-position~
++ ~mpris-get-loop-status~
++ ~mpris-get-shuffle~
++ ~mpris-get-volume~
++ ~mpris-get-rate~
++ ~mpris-get-maximum-rate~
++ ~mpris-get-minimum-rate~
+
+For convenience, there's also one extra function that isn't a trivial
+translation of the DBus API:
++ ~mpris-track-attr~
+
+* Change hooks
+
+Thanks to the event-driven design, there are a few hooks you can subscribe to
+for particular attributes of the current playback.
++ ~mpris-playback-status-change-hook~
++ ~mpris-metadata-change-hook~
++ ~mpris-current-player-change-hook~
++ ~mpris-current-status-hook~
+
+* Controlling a player
+
+The following functions affect the playback of the current track:
++ ~mpris-play~
++ ~mpris-pause~
++ ~mpris-play-pause~
++ ~mpris-stop~
++ ~mpris-seek~
++ ~mpris-set-position~
+
+To change the currently playing track, you can use:
++ ~mpris-next~
++ ~mpris-previous~
++ ~mpris-open-uri~
++ ~mpris-open-file~
+
+To change other behaviours of the media player, you can use:
++ ~mpris-set-rate~
++ ~mpris-set-volume~
++ ~mpris-set-shuffle~
++ ~mpris-set-loop-status~
+
+To tell how the player can be controlled, use these predicate functions:
++ ~mpris-can-play~
++ ~mpris-can-seek~
++ ~mpris-can-pause~
++ ~mpris-can-control~
++ ~mpris-can-go-next~
++ ~mpris-can-go-previous~
+
+* The "current" player
+
+All of the query and control functions take a string specifying the MPRIS
+service that should be interacted with. When omitted, the "current" player is
+used. What is the current player though?
+
+The ~mpris-current-player~ variable records the service considered the "current"
+player. It is updated as you change which players are actively used. The
+determination of the active player can be tweaked via the following
+customisation variables:
++ ~mpris-preferred-players~
++ ~mpris-disliked-players~
