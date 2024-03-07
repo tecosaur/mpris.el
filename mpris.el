@@ -80,8 +80,11 @@ forms:
 3. (player NEW-CURRENT-PLAYER-SERVICE)"
   :type 'hook)
 
-(defconst mpris--dbus-path "/org/mpris/MediaPlayer2")
-(defconst mpris--dbus-interface "org.mpris.MediaPlayer2.Player")
+(defconst mpris--dbus-path                "/org/mpris/MediaPlayer2")
+(defconst mpris--dbus-interface           "org.mpris.MediaPlayer2")
+(defconst mpris--dbus-interface-player    "org.mpris.MediaPlayer2.Player")
+(defconst mpris--dbus-interface-tracklist "org.mpris.MediaPlayer2.TrackList")
+(defconst mpris--dbus-interface-playlists "org.mpris.MediaPlayer2.Playlists")
 
 (defvar mpris-current-player nil
   "The primary DBus service communicated with.")
@@ -103,58 +106,67 @@ Each entry is of the form:
    :playback-status STATUS-STRING
    :metadata METADATA-LIST)")
 
+(defvar mpris--is-setup nil
+  "Indicator of whether MPRIS is setup up.
+Practically, this referres to wheter all the relevant watchers are set up.")
+
 (defvar mpris--dbus-player-existance-watcher nil
   "DBus watcher that looks for new and deleted services.")
 
-(defvar mpris--after-init-callbacks nil
-  "List of funcalls queued to be executed after watcher initialisation.")
+(defvar mpris--after-sync-callbacks nil
+  "List of funcalls queued to be executed on the next watcher syncronisation.")
+
+(defvar mpris--player-interfaces nil)
 
 ;;; Syncronous internal API
 
-(defun mpris--call-method-sync (method args &optional service)
-  "Call METHOD of the current player, with ARGS.
+(defun mpris--call-method-sync (service interface method args)
+  "Call METHOD of the current player's INTERFACE, with ARGS.
 To use a different player, set SERVICE to the target MediaPlayer2 service."
   (apply #'dbus-call-method
          mpris-bus-address (or service mpris-current-player)
-         mpris--dbus-path mpris--dbus-interface
+         mpris--dbus-path interface
          method args))
 
-(defun mpris--get-property-sync (property &optional service)
-  "Asyncronously get PROPERTY of the current player, call HANDLER on the result.
+(defun mpris--get-property-sync (service interface property)
+  "Get PROPERTY of the current player's INTERFACE.
 To use a different player, set SERVICE to the target MediaPlayer2 service."
   (dbus-get-property
    mpris-bus-address (or service mpris-current-player)
-   mpris--dbus-path mpris--dbus-interface property))
+   mpris--dbus-path interface
+   property))
 
-(defun mpris--set-property-sync (property value &optional service)
-  "Asyncronously set PROPERTY of the current player to VALUE.
+(defun mpris--set-property-sync (service interface property value)
+  "Set PROPERTY of the current player's INTERFACE to VALUE.
 To use a different player, set SERVICE to the target MediaPlayer2 service."
   (dbus-set-property
    mpris-bus-address (or service mpris-current-player)
-   mpris--dbus-path mpris--dbus-interface property value))
+   mpris--dbus-path interface
+   property value))
 
 ;;; Async internal API
 
-(defun mpris--call-method-async (method args handler &optional service)
-  "Asyncronously call METHOD of the current player, with ARGS.
-HANDLER is run on the result of the method call.
+(defun mpris--call-method-async (handler service interface method args)
+  "Asyncronously call METHOD of the current player's INTERFACE, with ARGS.
+HANDLER is called on the result of the method call.
 To use a different player, set SERVICE to the target MediaPlayer2 service."
   (apply #'dbus-call-method-asynchronously
          mpris-bus-address (or service mpris-current-player)
-         mpris--dbus-path mpris--dbus-interface
+         mpris--dbus-path interface
          method handler args))
 
-(defun mpris--get-property-async (property handler &optional service)
-  "Asyncronously get PROPERTY of the current player, call HANDLER on the result.
+(defun mpris--get-property-async (handler service interface property)
+  "Asyncronously get PROPERTY of the current player's INTERFACE.
+HANDLER is called on the result of the method call.
 To use a different player, set SERVICE to the target MediaPlayer2 service."
   (dbus-call-method-asynchronously
    mpris-bus-address (or service mpris-current-player)
    mpris--dbus-path dbus-interface-properties
    "Get" handler
-   :timeout 500 mpris--dbus-interface property))
+   :timeout 500 interface property))
 
-(defun mpris--set-property-async (property value handler &optional service)
-  "Asyncronously set PROPERTY of the current player to VALUE.
+(defun mpris--set-property-async (handler service interface property value)
+  "Asyncronously set PROPERTY of the current player's INTERFACE to VALUE.
 HANDLER is then called on the result.
 
 To use a different player, set SERVICE to the target MediaPlayer2 service."
@@ -162,109 +174,122 @@ To use a different player, set SERVICE to the target MediaPlayer2 service."
    mpris-bus-address (or service mpris-current-player)
    mpris--dbus-path dbus-interface-properties
    "Set" handler
-   :timeout 500 mpris--dbus-interface property
+   :timeout 500 interface property
    (cons :variant (list value))))
 
 ;;; Combined Sync/Async internal API
 
-(defun mpris--call-method (async-handler service method &rest args)
-  "Call METHOD of the current player, with ARGS.
+(defun mpris--call-method (async-handler service interface method &rest args)
+  "Call METHOD of the current player's INTERFACE, with ARGS.
 If ASYNC-HANDLER is non-nil, this call will be made asyncronously
 and ASYNC-HANDLER called on the result.
 
 To use a different player, set SERVICE to the target MediaPlayer2 service.
 
 If SERVICE is unset and no player exists, the symbol no-player is returned."
-  (cond
-   ((and async-handler service)
-    (mpris--call-method-async method args async-handler service))
-   (async-handler
-    (mpris--check-current-player
-     #'mpris--call-method-async method args async-handler service))
-   ((or service (mpris--check-current-player))
-    (mpris--call-method-sync method args service))
-   (t
-    (unless mpris--dbus-player-existance-watcher
-      (mpris--setup-watchers))
-    'no-player)))
+  (mpris--checked-call
+   #'mpris--call-method-sync #'mpris--call-method-async
+   async-handler service
+   interface method args))
 
-(defun mpris--get-property (property &optional async-handler service)
-  "Get PROPERTY of the current player.
+(defun mpris--get-property (async-handler service interface property)
+  "Get PROPERTY of the current player's INTERFACE.
 If ASYNC-HANDLER is non-nil, this call will be made asyncronously
 and ASYNC-HANDLER called on the result.
 
 To use a different player, set SERVICE to the target MediaPlayer2 service.
 
 If SERVICE is unset and no player exists, the symbol no-player is returned."
-  (cond
-   ((and async-handler service)
-    (mpris--get-property-async property async-handler service))
-   (async-handler
-    (mpris--check-current-player
-     #'mpris--get-property-async property async-handler service))
-   ((or service (mpris--check-current-player))
-    (mpris--get-property-sync property service))
-   (t
-    (unless mpris--dbus-player-existance-watcher
-      (mpris--setup-watchers))
-    'no-player)))
+  (mpris--checked-call
+   #'mpris--get-property-sync #'mpris--get-property-async
+   async-handler service interface property))
 
-(defun mpris--set-property (property value &optional async-handler service)
-  "Set PROPERTY of the current player to VALUE.
+(defun mpris--set-property (async-handler service interface property value)
+  "Set PROPERTY of the current player's INTERFACE to VALUE.
 If ASYNC-HANDLER is non-nil, this call will be made asyncronously
 and ASYNC-HANDLER called on the result.
 
 To use a different player, set SERVICE to the target MediaPlayer2 service.
 
 If SERVICE is unset and no player exists, the symbol no-player is returned."
+  (mpris--checked-call
+   #'mpris--set-property-sync #'mpris--set-property-async
+   async-handler service interface property value))
+
+(defun mpris--checked-call (sync-fn async-fn async-handler service &rest args)
+  "Perform a syncronous or asyncronous call, checking the mpris state.
+When ASYNC-FN is provided, it will be called like so:
+    \\=(apply ASYNC-FN ASYNC-HANDLER SERVICE ARGS)
+Otherwise SYNC-FN will be called like so:
+    \\=(apply SYNC-FN SERVICE ARGS)"
   (cond
-   ((and async-handler service)
-    (mpris--set-property-async property value async-handler service))
+   ((and mpris--is-setup (not service) (not mpris-current-player))
+    'no-player)
+   ((and mpris--is-setup async-handler)
+    (apply async-fn async-handler service args))
    (async-handler
-    (mpris--check-current-player
-     #'mpris--set-property-async property value async-handler service))
-   ((or service (mpris--check-current-player))
-    (mpris--set-property-sync property value service))
+    (push (append (list async-fn async-handler service) args)
+          mpris--after-sync-callbacks)
+    (mpris--setup-async))
+   (mpris--is-setup
+    (apply sync-fn service args))
+   (service
+    (mpris--setup-async)
+    (apply sync-fn service args))
    (t
-    (unless mpris--dbus-player-existance-watcher
-      (mpris--setup-watchers))
-    'no-player)))
+    (mpris--setup-sync)
+    (if mpris-current-player
+        (apply sync-fn service args)
+      'no-player))))
 
 ;;; State updates
 
-(defun mpris--setup-watchers ()
+(defun mpris--setup-async ()
   "Register signal handlers for the current players."
-  (mpris--teardown-watchers)
+  (mpris--teardown)
   (mpris--list-dbus-services
    (mpris--update-service-list
-    #'mpris--setup-watchers-1)))
+    #'mpris--setup-1)))
 
-(defun mpris--setup-watchers-1 ()
-  "Fulfil the promise of `mpris--setup-watchers'."
-  (unless mpris--dbus-player-existance-watcher
-    (setq mpris--dbus-player-existance-watcher
-          (dbus-register-signal
-           :session
-           dbus-interface-dbus
-           dbus-path-dbus
-           dbus-interface-dbus
-           "NameOwnerChanged"
-           #'mpris--handle-dbus-name-owner-changed)))
-  (mapc #'mpris--create-player-watcher mpris--active-players)
-  (unless mpris--active-players
-    (mapc (lambda (fn-args) (apply (car fn-args) (cdr fn-args)))
-          mpris--after-init-callbacks)
-    (setq mpris--after-init-callbacks nil)))
+(defun mpris--setup-1 ()
+  "Fulfil the promise of `mpris--setup-async'."
+  (unless mpris--is-setup
+    (setq mpris--is-setup t)
+    (unless mpris--dbus-player-existance-watcher
+      (setq mpris--dbus-player-existance-watcher
+            (dbus-register-signal
+             :session
+             dbus-interface-dbus
+             dbus-path-dbus
+             dbus-interface-dbus
+             "NameOwnerChanged"
+             #'mpris--handle-dbus-name-owner-changed)))
+    (mapc #'mpris--create-player-watcher mpris--active-players)
+    (unless mpris--active-players
+      (mapc (lambda (fn-args) (apply (car fn-args) (cdr fn-args)))
+            mpris--after-sync-callbacks)
+      (setq mpris--after-sync-callbacks nil))))
 
-(defun mpris--teardown-watchers ()
-  "Unregister any watchers created by `mpris--setup-watchers'."
+(defun mpris--setup-sync ()
+  "Perform `mpris--setup-async', but syncronously."
+  (mpris--update-service-list
+   (dbus-call-method
+    mpris-bus-address dbus-service-dbus dbus-path-dbus
+    dbus-interface-dbus "ListNames"))
+  (mpris--setup-1))
+
+(defun mpris--teardown ()
+  "Unregister any watchers created by `mpris--setup-async'."
   (when mpris--dbus-player-existance-watcher
     (dbus-unregister-object mpris--dbus-player-existance-watcher)
     (setq mpris--dbus-player-existance-watcher nil))
-  (mapc #'mpris--remove-player-watcher mpris--player-states))
+  (mapc #'mpris--remove-player-watcher mpris--player-states)
+  (setq mpris--is-setup nil))
 
 (defun mpris--create-player-watcher (player-service)
-  "Create a watcher for PLAYER-SERVICE and add it to `mpris--player-states'."
+  "Create a watcher for PLAYER-SERVICE and add it to `mpris--player-states'.
+Also ensure PLAYER-SERVICE has an entry in `mpris--player-interfaces'."
+  (mpris--inspect-interfaces player-service)
   (let ((watcher
          (dbus-register-signal
           :session
@@ -273,7 +298,7 @@ If SERVICE is unset and no player exists, the symbol no-player is returned."
           dbus-interface-properties
           "PropertiesChanged"
           (mpris--create-player-property-change-handler player-service)
-          mpris--dbus-interface)))
+          mpris--dbus-interface-player)))
     (push (list player-service :watcher watcher :playback-status nil :metadata nil)
           mpris--player-states)
     (mpris--update-playback-status player-service)
@@ -308,7 +333,8 @@ modifies `mpris--player-states' appropriately to reflect the new information."
             (plist-put state :playback-status value)
             (run-hook-with-args 'mpris-playback-status-change-hook service value)
             (when (equal service mpris-current-player)
-              (run-hook-with-args 'mpris-current-status-hook 'playback value)))
+              (run-hook-with-args 'mpris-current-status-hook 'playback value))
+            (mpris-update-current-player))
            ((and (equal change-type "Metadata")
                  (consp value))
             (plist-put state :metadata value)
@@ -331,19 +357,21 @@ modifies `mpris--player-states' appropriately to reflect the new information."
 
 (defun mpris--update-playback-status (service-name)
   "Update the playback-status entry for SERVICE-NAME in `mpris--player-states'."
-  (mpris--get-property
-   "PlaybackStatus"
+  (mpris--get-property-async
    (lambda (status)
      (mpris--update-state-attr service-name :playback-status (car-safe status)))
-   service-name))
+   service-name
+   mpris--dbus-interface-player
+   "PlaybackStatus"))
 
 (defun mpris--update-metadata (service-name)
   "Update the metadata entry for SERVICE-NAME in `mpris--player-states'."
-  (mpris--get-property
-   "Metadata"
+  (mpris--get-property-async
    (lambda (metadata)
      (mpris--update-state-attr service-name :metadata (car-safe metadata)))
-   service-name))
+   service-name
+   mpris--dbus-interface-player
+   "Metadata"))
 
 (defun mpris--update-state-attr (service-name attr value)
   "Set SERVICE-NAME's recorded ATTR to VALUE in `mpris--player-states'."
@@ -357,16 +385,14 @@ modifies `mpris--player-states' appropriately to reflect the new information."
         (when (memq nil (cdr state))
           (setq incomplete t))))
     ;; If `did-initialise-attr' and not `incomplete', this means we've just
-    ;; finished initialising all of `mpris--player-states' (likely after adding
-    ;; a new player). As such, it makes sense to update the current player.
+    ;; finished synchronising `mpris--player-states' (likely after adding
+    ;; a new player). As such, it makes sense to update the current player
+    ;; and run the after-sync callbacks.
     (when (and did-initialise-attr (not incomplete))
       (mpris-update-current-player)
-      ;; If `mpris--after-init-callbacks' is non-nil, this should be the first
-      ;; complete initialisation, as such we should run those callbacks.
-      (when mpris--after-init-callbacks
-        (mapc (lambda (fn-args) (apply (car fn-args) (cdr fn-args)))
-              mpris--after-init-callbacks)
-        (setq mpris--after-init-callbacks nil)))))
+      (mapc (lambda (fn-args) (apply (car fn-args) (cdr fn-args)))
+            mpris--after-sync-callbacks)
+      (setq mpris--after-sync-callbacks nil))))
 
 (defun mpris--list-dbus-services (callback)
   "Fetch a list of DBus services, then call CALLBACK on it."
@@ -393,6 +419,31 @@ SERVICE-LIST-OR-CALLBACK can either be:
     (dolist (service service-list-or-callback)
       (when (string-prefix-p "org.mpris.MediaPlayer2." service)
         (push service mpris--active-players))))))
+
+(defun mpris--inspect-interfaces (service)
+  "Populate `mpris--player-interfaces' with information on SERVICE's interfaces."
+  (unless (assoc service mpris--player-interfaces)
+    (let (data)
+      (dolist (interface (dbus-introspect-get-interface-names
+                          mpris-bus-address service mpris--dbus-path))
+        (let ((methods (dbus-introspect-get-method-names
+                        mpris-bus-address service mpris--dbus-path interface))
+              (properties (dbus-introspect-get-property-names
+                           mpris-bus-address service mpris--dbus-path interface)))
+          (push (list interface methods properties) data)))
+      (push (cons service data) mpris--player-interfaces))))
+
+(defun mpris--player-interface-p (service interface)
+  "Return non-nil if SERVICE implements INTERFACE."
+  (and (assoc interface (cdr (assoc service mpris--player-interfaces))) t))
+
+(defun mpris--player-method-p (service interface method)
+  "Return non-nil if SERVICE implements INTERFACE and METHOD."
+  (and (member method (cadr (assoc interface (cdr (assoc service mpris--player-interfaces))))) t))
+
+(defun mpris--player-property-p (service interface property)
+  "Return non-nil if SERVICE implements INTERFACE and has PROPERTY."
+  (and (member property (caddr (assoc interface (cdr (assoc service mpris--player-interfaces))))) t))
 
 ;;; The current player
 
@@ -423,17 +474,21 @@ and `mpris--player-states'."
            ((member name mpris-preferred-players)
             (push service preferred-services))
            (t (push service common-services)))))
+      (setq preferred-services (nreverse preferred-services))
+      (setq recent-services (nreverse recent-services))
       ;; First, look for playing services. With priority order:
       ;; 1. Preferred
       ;; 2. Recently played
       ;; 3. Remaining (not disliked)
       ;; 4. Disliked services
-      (dolist (service-sublist
-               (list recent-services preferred-services common-services disliked-services))
-        (dolist (service service-sublist)
-          (unless selected-service
-            (when (equal "Playing" (mpris--get-property-sync "PlaybackStatus" service))
-              (setq selected-service service)))))
+      ;; Then try again with paused services.
+      (dolist (playback-state '("Playing" "Paused"))
+        (dolist (service-sublist
+                 (list recent-services preferred-services common-services disliked-services))
+          (dolist (service service-sublist)
+            (unless selected-service
+              (when (equal playback-state (mpris-get-playback-status nil service))
+                (setq selected-service service))))))
       ;; If no service has been selected so far, apply the same priority order
       ;; but now just looking for any service that exists.
       (unless selected-service
@@ -464,17 +519,250 @@ exists, or after the background player update completes."
     (apply callback-fn callback-args))
    (mpris-current-player t)
    ((and callback-fn (not mpris--dbus-player-existance-watcher))
-    (push (cons callback-fn callback-args) mpris--after-init-callbacks)
-    (mpris--setup-watchers))))
+    (push (cons callback-fn callback-args) mpris--after-sync-callbacks)
+    (mpris--setup-async))))
 
-;;; MPRIS API - Methods
+;;; MPRIS API
+;; Here we define all the method calls and property acessors
+;; listed in <https://specifications.freedesktop.org/mpris-spec/2.2/Media_Player.html>
+
+;;;; MPRIS API - Methods
+
+(defun mpris-raise (&optional async-handler service)
+  "Bring the current player's user interface to the front, if possible.
+
+The media player may be unable to control how its user interface
+is displayed, or it may not have a graphical user interface at
+all. In this case, the `mpris-can-raise' property is false and
+this method does nothing.
+
+When ASYNC-HANDLER is set, the call is made asynchronously and the function
+called with the result.
+
+To use a specific player, set SERVICE to the target MediaPlayer2 service.
+
+If SERVICE is unset and no player exists, the symbol no-player is returned."
+  (mpris--call-method async-handler service mpris--dbus-interface "Raise"))
+
+(defun mpris-quit (&optional async-handler service)
+  "Stop running the current player.
+
+The media player may refuse to allow clients to shut it down. In
+this case, the `mpris-can-quit' property is false and this method
+does nothing.
+
+Note: Media players which can be D-Bus activated, or for which
+there is no sensibly easy way to terminate a running
+instance (via the main interface or a notification area icon for
+example) should allow clients to use this method. Otherwise, it
+should not be needed.
+
+If the media player does not have a UI, this should be implemented.
+
+When ASYNC-HANDLER is set, the call is made asynchronously and the function
+called with the result.
+
+To use a specific player, set SERVICE to the target MediaPlayer2 service.
+
+If SERVICE is unset and no player exists, the symbol no-player is returned."
+  (mpris--call-method async-handler service mpris--dbus-interface "Quit"))
+
+;;;; MPRIS API - Properties
+
+(defun mpris-can-quit (&optional async-handler service)
+  "Whether quit is expected to have an effect.
+
+If false, calling `mpris-quit' will have no effect, and may raise
+a NotSupported error. If true, calling `mpris-quit' will cause
+the media application to attempt to quit (although it may still
+be prevented from quitting by the user, for example).
+
+When ASYNC-HANDLER is set, the call is made asynchronously and the function
+called with the result.
+
+To use a specific player, set SERVICE to the target MediaPlayer2 service.
+
+If SERVICE is unset and no player exists, the symbol no-player is returned."
+  (mpris--get-property async-handler service
+                      mpris--dbus-interface "CanQuit"))
+
+(defun mpris-get-fullscreen (&optional async-handler service)
+  "Whether the current player is occupying the fullscreen.
+
+This is typically used for videos. A value of true indicates that
+the media player is taking up the full screen.
+
+Media centre software may well have this value fixed to true
+
+When ASYNC-HANDLER is set, the call is made asynchronously and the function
+called with the result.
+
+To use a specific player, set SERVICE to the target MediaPlayer2 service.
+
+If SERVICE is unset and no player exists, the symbol no-player is returned."
+  (if (mpris--player-property-p (or service mpris-current-player) mpris--dbus-interface "Fullscreen")
+      (mpris--get-property async-handler service mpris--dbus-interface "Fullscreen")
+    'unimplemented))
+
+(defun mpris-set-fullscreen (value &optional async-handler service)
+  "Set the current player fullscreen status to VALUE (boolean).
+
+If `mpris-can-set-fullscreen' is true, clients may set this
+property to true to tell the media player to enter fullscreen
+mode, or to false to return to windowed mode.
+
+If `mpris-can-set-fullscreen' is false, then attempting to set
+this property should have no effect, and may raise an error.
+However, even if it is true, the media player may still be unable
+to fulfil the request, in which case attempting to set this
+property will have no effect (but should not raise an error).
+
+When ASYNC-HANDLER is set, the call is made asynchronously and the function
+called with the result.
+
+To use a specific player, set SERVICE to the target MediaPlayer2 service.
+
+If SERVICE is unset and no player exists, the symbol no-player is returned."
+  (if (mpris--player-property-p (or service mpris-current-player) mpris--dbus-interface "Fullscreen")
+      (mpris--set-property async-handler service mpris--dbus-interface
+                           "Fullscreen" value)
+    'unimplemented))
+
+(defun mpris-can-set-fullscreen (&optional async-handler service)
+  "Whether the current player's fullscreen state can be controlled.
+
+If false, attempting `mpris-set-fullscreen' will have no effect,
+and may raise an error. If true, attempting
+`mpris-set-fullscreen' will not raise an error, and (if it is
+different from the current value) will cause the media player to
+attempt to enter or exit fullscreen mode.
+
+Note that the media player may be unable to fulfil the request.
+In this case, the value will not change. If the media player
+knows in advance that it will not be able to fulfil the request,
+however, this property should be false.
+
+When ASYNC-HANDLER is set, the call is made asynchronously and the function
+called with the result.
+
+To use a specific player, set SERVICE to the target MediaPlayer2 service.
+
+If SERVICE is unset and no player exists, the symbol no-player is returned."
+  (if (mpris--player-property-p
+       (or service mpris-current-player) mpris--dbus-interface "CanSetFullscreen")
+      (mpris--get-property async-handler service mpris--dbus-interface "CanSetFullscreen")
+    'unimplemented))
+
+(defun mpris-can-raise (&optional async-handler service)
+  "Whether the current player can be raised.
+
+If false, calling `mpris-raise' will have no effect, and may
+raise a NotSupported error. If true, calling `mpris-raise' will
+cause the media application to attempt to bring its user
+interface to the front, although it may be prevented from doing
+so (by the window manager, for example).
+
+When ASYNC-HANDLER is set, the call is made asynchronously and the function
+called with the result.
+
+To use a specific player, set SERVICE to the target MediaPlayer2 service.
+
+If SERVICE is unset and no player exists, the symbol no-player is returned."
+  (mpris--get-property async-handler service
+                      mpris--dbus-interface "CanRaise"))
+
+(defun mpris-has-track-list (&optional async-handler service)
+  "Indicate whether the current player implements the TrackList interface.
+
+When ASYNC-HANDLER is set, the call is made asynchronously and the function
+called with the result.
+
+To use a specific player, set SERVICE to the target MediaPlayer2 service.
+
+If SERVICE is unset and no player exists, the symbol no-player is returned."
+  (mpris--get-property async-handler service
+                      mpris--dbus-interface "HasTrackList"))
+
+(defun mpris-identity (&optional async-handler service)
+  "A friendly name to identify the current player to users.
+
+This should usually match the name found in .desktop files.
+
+When ASYNC-HANDLER is set, the call is made asynchronously and the function
+called with the result.
+
+To use a specific player, set SERVICE to the target MediaPlayer2 service.
+
+If SERVICE is unset and no player exists, the symbol no-player is returned."
+  (mpris--get-property async-handler service
+                      mpris--dbus-interface "Identity"))
+
+(defun mpris-desktop-entry (&optional async-handler service)
+  "The desktop entry of the current player.
+
+The basename of an installed .desktop file which complies with
+the Desktop entry specification, with the \".desktop\" extension stripped.
+
+Example: The desktop entry file is
+\"/usr/share/applications/vlc.desktop\", and this property
+contains \"vlc\".
+
+When ASYNC-HANDLER is set, the call is made asynchronously and the function
+called with the result.
+
+To use a specific player, set SERVICE to the target MediaPlayer2 service.
+
+If SERVICE is unset and no player exists, the symbol no-player is returned."
+  (mpris--get-property async-handler service
+                      mpris--dbus-interface "DesktopEntry"))
+
+(defun mpris-supported-uri-schemes (&optional async-handler service)
+  "The URI schemes supported by the current player.
+
+This can be viewed as protocols supported by the player in almost
+all cases. Almost every media player will include support for the
+\"file\" scheme. Other common schemes are \"http\" and \"rtsp\".
+
+Note that URI schemes should be lower-case.
+
+When ASYNC-HANDLER is set, the call is made asynchronously and the function
+called with the result.
+
+To use a specific player, set SERVICE to the target MediaPlayer2 service.
+
+If SERVICE is unset and no player exists, the symbol no-player is returned."
+  (mpris--get-property async-handler service
+                      mpris--dbus-interface "SupportedUriSchemes"))
+
+(defun mpris-supported-mime-types (&optional async-handler service)
+  "The mime-types supported by the current player.
+
+Mime-types should be in the standard format (eg: \"audio/mpeg\"
+or \"application/ogg\").
+
+When ASYNC-HANDLER is set, the call is made asynchronously and the function
+called with the result.
+
+To use a specific player, set SERVICE to the target MediaPlayer2 service.
+
+If SERVICE is unset and no player exists, the symbol no-player is returned."
+  (mpris--get-property async-handler service
+                      mpris--dbus-interface "SupportedMimeTypes"))
+
+;;; MPRIS Player API
+;; Here we define all the method calls and property acessors
+;; listed in <https://specifications.freedesktop.org/mpris-spec/latest/Player_Interface.html>
+
+;;;; MPRIS Player API - Methods
 
 (defun mpris-next (&optional async-handler service)
   "Skip to the next track in the tracklist.
+
 If there is no next track (and endless playback and track repeat are both off),
 stop playback. If playback is paused or stopped, it remains that way.
 
-If CanGoNext is false, attempting to call this method should have no effect.
+If `mpris-can-go-next' is false, attempting to call this method
+should have no effect.
 
 When ASYNC-HANDLER is set, the call is made asynchronously and the function
 called on completion with a single nil argument.
@@ -483,14 +771,16 @@ To use a specific player, set SERVICE to the target MediaPlayer2 service.
 
 If SERVICE is unset and no player exists, the symbol no-player is returned."
   (interactive (list #'ignore))
-  (mpris--call-method async-handler service "Next"))
+  (mpris--call-method async-handler service mpris--dbus-interface-player "Next"))
 
 (defun mpris-previous (&optional async-handler service)
   "Skips to the previous track in the tracklist.
+
 If there is no previous track (and endless playback and track repeat are both
 off), stop playback.  If playback is paused or stopped, it remains that way.
 
-If CanGoPrevious is false, attempting to call this method should have no effect.
+If `mpris-can-go-previous' is false, attempting to call this
+method should have no effect.
 
 When ASYNC-HANDLER is set, the call is made asynchronously and the function
 called on completion with a single nil argument.
@@ -499,14 +789,16 @@ To use a specific player, set SERVICE to the target MediaPlayer2 service.
 
 If SERVICE is unset and no player exists, the symbol no-player is returned."
   (interactive (list #'ignore))
-  (mpris--call-method async-handler service "Previous"))
+  (mpris--call-method async-handler service mpris--dbus-interface-player "Previous"))
 
 (defun mpris-pause (&optional async-handler service)
   "Pauses playback.
+
 If playback is already paused, this has no effect. Calling Play after this
 should cause playback to start again from the same position.
 
-If CanPause is false, attempting to call this method should have no effect.
+If `mpris-can-pause' is false, attempting to call this method
+should have no effect.
 
 When ASYNC-HANDLER is set, the call is made asynchronously and the function
 called on completion with a single nil argument.
@@ -515,15 +807,16 @@ To use a specific player, set SERVICE to the target MediaPlayer2 service.
 
 If SERVICE is unset and no player exists, the symbol no-player is returned."
   (interactive (list #'ignore))
-  (mpris--call-method async-handler service "Pause"))
+  (mpris--call-method async-handler service mpris--dbus-interface-player "Pause"))
 
 (defun mpris-play-pause (&optional async-handler service)
   "Pause or resume playback.
+
 If playback is already paused, resumes playback. If playback is stopped, starts
 playback.
 
-If CanPause is false, attempting to call this method should have
-no effect and raise an error.
+If `mpris-can-pause' is false, attempting to call this method
+should have no effect and raise an error.
 
 When ASYNC-HANDLER is set, the call is made asynchronously and the function
 called on completion with a single nil argument.
@@ -532,15 +825,16 @@ To use a specific player, set SERVICE to the target MediaPlayer2 service.
 
 If SERVICE is unset and no player exists, the symbol no-player is returned."
   (interactive (list #'ignore))
-  (mpris--call-method async-handler service "PlayPause"))
+  (mpris--call-method async-handler service mpris--dbus-interface-player "PlayPause"))
 
 (defun mpris-stop (&optional async-handler service)
   "Stops playback.
+
 If playback is already stopped, this has no effect. Calling Play after this
 should cause playback to start again from the beginning of the track.
 
-If CanControl is false, attempting to call this method should have no effect and
-raise an error.
+If `mpris-can-control' is false, attempting to call this method
+should have no effect and raise an error.
 
 When ASYNC-HANDLER is set, the call is made asynchronously and the function
 called on completion with a single nil argument.
@@ -549,7 +843,7 @@ To use a specific player, set SERVICE to the target MediaPlayer2 service.
 
 If SERVICE is unset and no player exists, the symbol no-player is returned."
   (interactive (list #'ignore))
-  (mpris--call-method async-handler service "Stop"))
+  (mpris--call-method async-handler service mpris--dbus-interface-player "Stop"))
 
 (defun mpris-play (&optional async-handler service)
   "Start or resume playback.
@@ -558,7 +852,8 @@ If already playing, this has no effect.
 If paused, playback resumes from the current position.
 If there is no track to play, this has no effect.
 
-If CanPlay is false, attempting to call this method should have no effect.
+If `mpris-can-play' is false, attempting to call this method
+should have no effect.
 
 When ASYNC-HANDLER is set, the call is made asynchronously and the function
 called on completion with a single nil argument.
@@ -567,15 +862,16 @@ To use a specific player, set SERVICE to the target MediaPlayer2 service.
 
 If SERVICE is unset and no player exists, the symbol no-player is returned."
   (interactive (list #'ignore))
-  (mpris--call-method async-handler service "Play"))
+  (mpris--call-method async-handler service mpris--dbus-interface-player "Play"))
 
 (defun mpris-seek (offset &optional async-handler service)
   "Seeks forward in the current track by OFFSET microseconds.
+
 A negative value seeks back. If this would mean seeking back further than the
 start of the track, the position is set to 0.  If the value passed in would mean
 seeking beyond the end of the track, acts like a call to Next.
 
-If the CanSeek property is false, this has no effect.
+If the `mpris-can-seek' property is false, this has no effect.
 
 When ASYNC-HANDLER is set, the call is made asynchronously and the function
 called on completion with a single nil argument.
@@ -583,15 +879,16 @@ called on completion with a single nil argument.
 To use a specific player, set SERVICE to the target MediaPlayer2 service.
 
 If SERVICE is unset and no player exists, the symbol no-player is returned."
-  (mpris--call-method async-handler service "Seek" :int64 offset))
+  (mpris--call-method async-handler service mpris--dbus-interface-player
+                      "Seek" :int64 offset))
 
 (defun mpris-set-position (track-id position &optional async-handler service)
   "Set the current track (TRACK-ID) playback to POSITION microseconds.
 
-If the Position argument is less than 0, do nothing.
-If the Position argument is greater than the track length, do nothing.
+If POSITION argument is less than 0, do nothing.
+If POSITION argument is greater than the track length, do nothing.
 
-If the CanSeek property is false, this has no effect.
+If the `mpris-can-seek' property is false, this has no effect.
 
 The TRACK-ID argument is required to avoid race conditions where
 a client tries to seek a position after the track has already
@@ -603,23 +900,22 @@ called on completion with a single nil argument.
 To use a specific player, set SERVICE to the target MediaPlayer2 service.
 
 If SERVICE is unset and no player exists, the symbol no-player is returned."
-  (mpris--call-method async-handler service "SetPosition"
-                      :object-path track-id :int64 position))
+  (mpris--call-method async-handler service mpris--dbus-interface-player
+                      "SetPosition" :object-path track-id :int64 position))
 
 (defun mpris-open-uri (uri &optional async-handler service)
   "Open URI with the current player.
 
-The uri scheme should be an element of the
-org.mpris.MediaPlayer2.SupportedUriSchemes property and the
-mime-type should match one of the elements of the
-org.mpris.MediaPlayer2.SupportedMimeTypes.
+The uri scheme should be an element of
+`mpris-supported-uri-schemes' and the mime-type should match one
+of the elements of the `mpris-supported-mime-types'.
 
 If the uri scheme or the mime-type of the uri to open is not
 supported, this method does nothing and may raise an error. In
 particular, if the list of available uri schemes is empty, this
 method may not be implemented.
 
-Clients should not assume that the Uri has been opened as soon as
+Clients should not assume that URI has been opened as soon as
 this method returns. They should wait until the mpris:trackid
 field in the Metadata property changes.
 
@@ -637,9 +933,10 @@ called on completion with a single nil argument.
 To use a specific player, set SERVICE to the target MediaPlayer2 service.
 
 If SERVICE is unset and no player exists, the symbol no-player is returned."
-  (mpris--call-method async-handler service "OpenUri" uri))
+  (mpris--call-method async-handler service mpris--dbus-interface-player
+                      "OpenUri" uri))
 
-;;; MPRIS API - Properties
+;;; MPRIS Player API - Properties
 
 (defun mpris-get-playback-status (&optional async-handler service)
   "Get the current playback status.
@@ -653,15 +950,14 @@ To use a specific player, set SERVICE to the target MediaPlayer2 service.
 
 If SERVICE is unset and no player exists, the symbol no-player is returned."
   (if-let ((value
-            (and mpris--player-states
-                 (plist-get
-                  (cdr (assoc (or service mpris-current-player)
-                              mpris--player-states))
-                  :playback-status))))
+            (plist-get
+             (cdr (assoc (or service mpris-current-player) mpris--player-states))
+             :playback-status)))
       (if async-handler
           (funcall async-handler value)
         value)
-    (mpris--get-property "PlaybackStatus" async-handler service)))
+    (mpris--get-property async-handler service
+                         mpris--dbus-interface-player "PlaybackStatus")))
 
 (defun mpris-get-loop-status (&optional async-handler service)
   "Get the current loop/repeat status.
@@ -672,13 +968,20 @@ May be:
   finished playing.
 - \"Playlist\" if the playback loops through a list of tracks.
 
+This is an *optional* part of the MPRIS2 specification, if the current player
+does not support this option the symbol \\='unimplemented will be returned.
+
 When ASYNC-HANDLER is set, the call is made asynchronously and the function
 called with the result.
 
 To use a specific player, set SERVICE to the target MediaPlayer2 service.
 
 If SERVICE is unset and no player exists, the symbol no-player is returned."
-  (mpris--get-property "LoopStatus" async-handler service))
+  (if (mpris--player-property-p
+       (or service mpris-current-player) mpris--dbus-interface-player "LoopStatus")
+      (mpris--get-property async-handler service mpris--dbus-interface-player
+                           "LoopStatus")
+    'unimplemented))
 
 (defun mpris-set-loop-status (value &optional async-handler service)
   "Set the current loop/repeat status to VALUE.
@@ -689,8 +992,11 @@ VALUE may be:
   finished playing.
 - \"Playlist\" the playback loops through a list of tracks.
 
-If CanControl is false, attempting to set this property should
-have no effect and raise an error.
+This is an *optional* part of the MPRIS2 specification, if the current player
+does not support this option the symbol \\='unimplemented will be returned.
+
+If `mpris-can-control' is false, attempting to set this property
+should have no effect and raise an error.
 
 When ASYNC-HANDLER is set, the call is made asynchronously and the function
 called with the result.
@@ -698,7 +1004,11 @@ called with the result.
 To use a specific player, set SERVICE to the target MediaPlayer2 service.
 
 If SERVICE is unset and no player exists, the symbol no-player is returned."
-  (mpris--set-property "LoopStatus" value async-handler service))
+  (if (mpris--player-property-p
+       (or service mpris-current-player) mpris--dbus-interface-player "LoopStatus")
+      (mpris--set-property async-handler service mpris--dbus-interface-player
+                           "LoopStatus" value)
+    'unimplemented))
 
 (defun mpris-get-rate (&optional async-handler service)
   "Get the current playback rate.
@@ -709,21 +1019,22 @@ called with the result.
 To use a specific player, set SERVICE to the target MediaPlayer2 service.
 
 If SERVICE is unset and no player exists, the symbol no-player is returned."
-  (mpris--get-property "Rate" async-handler service))
+  (mpris--get-property async-handler service
+                       mpris--dbus-interface-player "Rate"))
 
 (defun mpris-set-rate (value &optional async-handler service)
   "Set the current playback rate to VALUE.
 
-The value must fall in the range described by MinimumRate and
+The value must fall in the range described by `mpris-get-minimum-rate' and
 MaximumRate, and must not be 0.0. If playback is paused, the
 PlaybackStatus property should be used to indicate this. A value
 of 0.0 should not be set by the client. If it is, the media
-player should act as though Pause was called.
+player should act as though `mpris-pause' was called.
 
 If the media player has no ability to play at speeds other than
 the normal playback rate, this must still be implemented, and
-must return 1.0. The MinimumRate and MaximumRate properties must
-also be set to 1.0.
+must return 1.0. The `mpris-get-minimum-rate' and
+`mpris-get-maximum-rate' properties must also be set to 1.0.
 
 Not all values may be accepted by the media player. It is left to
 media player implementations to decide how to deal with values
@@ -737,12 +1048,14 @@ called with the result.
 To use a specific player, set SERVICE to the target MediaPlayer2 service.
 
 If SERVICE is unset and no player exists, the symbol no-player is returned."
-  (mpris--set-property "Rate" value async-handler service))
+  (mpris--set-property async-handler service mpris--dbus-interface-player
+                       "Rate" value))
 
 (defun mpris-get-shuffle (&optional async-handler service)
   "Whether the playlist is progressing in a non-linear order.
 
-This property is optional. Clients should handle its absence gracefully.
+This is an *optional* part of the MPRIS2 specification, if the current player
+does not support this option the symbol \\='unimplemented will be returned.
 
 When ASYNC-HANDLER is set, the call is made asynchronously and the function
 called with the result.
@@ -750,14 +1063,19 @@ called with the result.
 To use a specific player, set SERVICE to the target MediaPlayer2 service.
 
 If SERVICE is unset and no player exists, the symbol no-player is returned."
-  (mpris--get-property "Shuffle" async-handler service))
+  (if (mpris--player-property-p
+       (or service mpris-current-player) mpris--dbus-interface-player "Shuffle")
+      (mpris--get-property async-handler service mpris--dbus-interface-player
+                           "Shuffle")
+    'unimplemented))
 
 (defun mpris-set-shuffle (value &optional async-handler service)
   "Set the playlist to progress in a non-linear order depending on VALUE.
 
 VALUE should be either t or nil.
 
-This property is optional. Clients should handle its absence gracefully.
+This is an *optional* part of the MPRIS2 specification, if the current player
+does not support this option the symbol \\='unimplemented will be returned.
 
 When ASYNC-HANDLER is set, the call is made asynchronously and the function
 called with the result.
@@ -765,7 +1083,11 @@ called with the result.
 To use a specific player, set SERVICE to the target MediaPlayer2 service.
 
 If SERVICE is unset and no player exists, the symbol no-player is returned."
-  (mpris--set-property "Shuffle" value async-handler service))
+  (if (mpris--player-property-p
+       (or service mpris-current-player) mpris--dbus-interface-player "Shuffle")
+      (mpris--set-property async-handler service mpris--dbus-interface-player
+                           "Shuffle" value)
+    'unimplemented))
 
 (defun mpris-get-metadata (&optional async-handler service)
   "Get the metadata of the current track.
@@ -777,15 +1099,14 @@ To use a specific player, set SERVICE to the target MediaPlayer2 service.
 
 If SERVICE is unset and no player exists, the symbol no-player is returned."
   (if-let ((value
-            (and mpris--player-states
-                 (plist-get
-                  (cdr (assoc (or service mpris-current-player)
-                              mpris--player-states))
-                  :metadata))))
+            (plist-get
+             (cdr (assoc (or service mpris-current-player) mpris--player-states))
+             :metadata)))
       (if async-handler
           (funcall async-handler value)
         value)
-    (mpris--get-property "Metadata" async-handler service)))
+    (mpris--get-property async-handler service
+                         mpris--dbus-interface-player "Metadata")))
 
 (defun mpris-get-volume (&optional async-handler service)
   "Get the volume level.
@@ -796,7 +1117,8 @@ called with the result.
 To use a specific player, set SERVICE to the target MediaPlayer2 service.
 
 If SERVICE is unset and no player exists, the symbol no-player is returned."
-  (mpris--get-property "Volume" async-handler service))
+  (mpris--get-property async-handler service
+                       mpris--dbus-interface-player "Volume"))
 
 (defun mpris-set-volume (value &optional async-handler service)
   "Set the volume level to VALUE.
@@ -804,8 +1126,8 @@ If SERVICE is unset and no player exists, the symbol no-player is returned."
 When setting, if a negative value is passed, the volume should be
 set to 0.0.
 
-If CanControl is false, attempting to set this property should
-have no effect and raise an error.
+If `mpris-can-control' is false, attempting to set this property
+should have no effect and raise an error.
 
 When ASYNC-HANDLER is set, the call is made asynchronously and the function
 called with the result.
@@ -813,7 +1135,8 @@ called with the result.
 To use a specific player, set SERVICE to the target MediaPlayer2 service.
 
 If SERVICE is unset and no player exists, the symbol no-player is returned."
-  (mpris--set-property "Volume" value async-handler service))
+  (mpris--set-property async-handler service mpris--dbus-interface-player
+                       "Volume" value))
 
 (defun mpris-get-position (&optional async-handler service)
   "The current track position in microseconds.
@@ -822,13 +1145,14 @@ The position is between 0 and the \"mpris:length\" metadata
 entry (see Metadata).
 
 Note: If the media player allows it, the current playback
-position can be changed either the SetPosition method or the Seek
-method on this interface. If this is not the case, the CanSeek
+position can be changed with either `mpris-set-position' or
+`mpris-seek'. If this is not the case, the `mpris-can-seek'
 property is false, and setting this property has no effect and
 can raise an error.
 
 If the playback progresses in a way that is inconstistant with
-the Rate property, the Seeked signal is emited.
+the Rate property (`mpris-get-rate'), the Seeked signal is
+emited.
 
 When ASYNC-HANDLER is set, the call is made asynchronously and the function
 called with the result.
@@ -836,15 +1160,16 @@ called with the result.
 To use a specific player, set SERVICE to the target MediaPlayer2 service.
 
 If SERVICE is unset and no player exists, the symbol no-player is returned."
-  (mpris--get-property "Position" async-handler service))
+  (mpris--get-property async-handler service
+                       mpris--dbus-interface-player "Position"))
 
 (defun mpris-get-minimum-rate (&optional async-handler service)
   "The minimum value which the Rate property can take.
 
-Clients should not attempt to set the Rate property below this value.
+Clients should not call `mpris-set-rate' with a lower value.
 
-Note that even if this value is 0.0 or negative, clients should
-not attempt to set the Rate property to 0.0.
+Note that even if this value is 0.0 or negative, `mpris-set-rate'
+should not be called with a value of 0.0 or below.
 
 This value should always be 1.0 or less.
 
@@ -854,12 +1179,13 @@ called with the result.
 To use a specific player, set SERVICE to the target MediaPlayer2 service.
 
 If SERVICE is unset and no player exists, the symbol no-player is returned."
-  (mpris--get-property "MinimumRate" async-handler service))
+  (mpris--get-property async-handler service
+                       mpris--dbus-interface-player "MinimumRate"))
 
 (defun mpris-get-maximum-rate (&optional async-handler service)
   "The maximum value which the Rate property can take.
 
-Clients should not attempt to set the Rate property above this value.
+Clients should not call `mpris-set-rate' with a greater value.
 
 This value should always be 1.0 or greater.
 
@@ -869,19 +1195,21 @@ called with the result.
 To use a specific player, set SERVICE to the target MediaPlayer2 service.
 
 If SERVICE is unset and no player exists, the symbol no-player is returned."
-  (mpris--get-property "MaximumRate" async-handler service))
+  (mpris--get-property async-handler service
+                       mpris--dbus-interface-player "MaximumRate"))
 
 (defun mpris-can-go-next (&optional async-handler service)
   "Whether `mpris-next' is expected to change the current track.
 
-More specifically, whether the client can call the Next method on
-this interface and expect the current track to change.
+More specifically, whether the client can call `mpris-next' and
+expect the current track to change.
 
-If it is unknown whether a call to Next will be successful (for
-example, when streaming tracks), this property should be set to
-true.
+If it is unknown whether a `mpris-next' call will be
+successful (for example, when streaming tracks), this property
+should be set to true.
 
-If CanControl is false, this property should also be false.
+If `mpris-can-control' is false, this property should also be
+false.
 
 When ASYNC-HANDLER is set, the call is made asynchronously and the function
 called with the result.
@@ -889,19 +1217,20 @@ called with the result.
 To use a specific player, set SERVICE to the target MediaPlayer2 service.
 
 If SERVICE is unset and no player exists, the symbol no-player is returned."
-  (mpris--get-property "CanGoNext" async-handler service))
+  (mpris--get-property async-handler service
+                       mpris--dbus-interface-player "CanGoNext"))
 
 (defun mpris-can-go-previous (&optional async-handler service)
   "Whether `mpris-previous' is expected to change the current track.
 
-More specifically, whether the client can call the Previous
-method on this interface and expect the current track to change.
+More specifically, whether the client can call `mpris-previous'
+and expect the current track to change.
 
-If it is unknown whether a call to Previous will be
+If it is unknown whether a `mpris-previous' call will be
 successful (for example, when streaming tracks), this property
 should be set to true.
 
-If CanControl is false, this property should also be false.
+If `mpris-can-control' is false, this property should also be false.
 
 When ASYNC-HANDLER is set, the call is made asynchronously and the function
 called with the result.
@@ -909,17 +1238,19 @@ called with the result.
 To use a specific player, set SERVICE to the target MediaPlayer2 service.
 
 If SERVICE is unset and no player exists, the symbol no-player is returned."
-  (mpris--get-property "CanGoPrevious" async-handler service))
+  (mpris--get-property async-handler service
+                       mpris--dbus-interface-player "CanGoPrevious"))
 
 (defun mpris-can-play (&optional async-handler service)
-  "Whether playback can be started using Play or PlayPause.
+  "Whether playback can be started using `mpris-play' or `mpris-play-pause'.
 
 Note that this is related to whether there is a \"current
 track\": the value should not depend on whether the track is
 currently paused or playing. In fact, if a track is currently
-playing (and CanControl is true), this should be true.
+playing (and `mpris-can-control' is true), this should be true.
 
-If CanControl is false, this property should also be false.
+If `mpris-can-control' is false, this property should also be
+false.
 
 When ASYNC-HANDLER is set, the call is made asynchronously and the function
 called with the result.
@@ -927,17 +1258,19 @@ called with the result.
 To use a specific player, set SERVICE to the target MediaPlayer2 service.
 
 If SERVICE is unset and no player exists, the symbol no-player is returned."
-  (mpris--get-property "CanPlay" async-handler service))
+  (mpris--get-property async-handler service
+                       mpris--dbus-interface-player "CanPlay"))
 
 (defun mpris-can-pause (&optional async-handler service)
-  "Whether playback can be paused using Pause or PlayPause.
+  "Whether playback can be paused using `mpris-pause' or `mpris-play-pause'.
 
 Note that this is an intrinsic property of the current track: its
 value should not depend on whether the track is currently paused
 or playing. In fact, if playback is currently paused (and
 CanControl is true), this should be true.
 
-If CanControl is false, this property should also be false.
+If `mpris-can-control' is false, this property should also be
+false.
 
 When ASYNC-HANDLER is set, the call is made asynchronously and the function
 called with the result.
@@ -945,14 +1278,16 @@ called with the result.
 To use a specific player, set SERVICE to the target MediaPlayer2 service.
 
 If SERVICE is unset and no player exists, the symbol no-player is returned."
-  (mpris--get-property "CanPause" async-handler service))
+  (mpris--get-property async-handler (or service mpris-current-player)
+                       mpris--dbus-interface-player "CanPause"))
 
 (defun mpris-can-seek (&optional async-handler service)
-  "Whether the client can control the playback position using Seek and SetPosition.
+  "Whether `mpris-seek' and `mpris-set-position' can control the playback position.
 
 This may be different for different tracks.
 
-If CanControl is false, this property should also be false.
+If `mpris-can-control' is false, this property should also be
+false.
 
 When ASYNC-HANDLER is set, the call is made asynchronously and the function
 called with the result.
@@ -960,7 +1295,8 @@ called with the result.
 To use a specific player, set SERVICE to the target MediaPlayer2 service.
 
 If SERVICE is unset and no player exists, the symbol no-player is returned."
-  (mpris--get-property "CanSeek" async-handler service))
+  (mpris--get-property async-handler service
+                       mpris--dbus-interface-player "CanSeek"))
 
 (defun mpris-can-control (&optional async-handler service)
   "Whether the media player may be controlled over this interface.
@@ -979,9 +1315,281 @@ called with the result.
 To use a specific player, set SERVICE to the target MediaPlayer2 service.
 
 If SERVICE is unset and no player exists, the symbol no-player is returned."
-  (mpris--get-property "CanControl" async-handler service))
+  (mpris--get-property async-handler service
+                       mpris--dbus-interface-player "CanControl"))
 
-;;; Utility functions
+(defun mpris-open-file (file &optional async-handler service)
+  "Open FILE with the current player.
+
+A thin wrapper around `mpris-open-uri'.
+
+When ASYNC-HANDLER is set, the call is made asynchronously and the function
+called on completion with a single nil argument.
+
+To use a specific player, set SERVICE to the target MediaPlayer2 service.
+
+If SERVICE is unset and no player exists, the symbol no-player is returned."
+  (mpris-open-uri
+   (url-encode-url (mpris--file-name-uri file))
+   async-handler service))
+
+;;; MPRIS TrackList API
+;; Here we define all the method calls and property acessors
+;; listed in <https://specifications.freedesktop.org/mpris-spec/latest/Track_List_Interface.html>
+
+;;;; MPRIS TrackList API - Methods
+
+(defun mpris-get-tracks-metadata (track-ids &optional async-handler service)
+  "Gets all the metadata available for a set of tracks.
+
+TRACK-IDS is the list of track ids for which metadata is requested.
+
+Each set of metadata must have a \"mpris:trackid\" entry at the
+very least, which contains a string that uniquely identifies this
+track within the scope of the tracklist.
+
+When ASYNC-HANDLER is set, the call is made asynchronously and the function
+called with the result.
+
+To use a specific player, set SERVICE to the target MediaPlayer2 service.
+
+If SERVICE is unset and no player exists, the symbol no-player is returned."
+  (if (mpris--player-interface-p (or service mpris-current-player) mpris--dbus-interface-tracklist)
+      (mpris--call-method async-handler service mpris--dbus-interface-tracklist
+                          "GetTracksMetadata" '(:array :object-path) track-ids)
+    'unimplemented))
+
+(defun mpris-add-track (uri after-track-id set-as-current &optional async-handler service)
+  "Add a URI to the TrackList.
+
+- URI is the uri of the item to add. Its uri scheme should be an
+  element of the `mpris-supported-uri-schemes' property and the
+  mime-type should match one of the elements of
+  `mpris-supported-mime-types'.
+
+- AFTER-TRACK-ID is the identifier of the track after which the
+  new item should be inserted. The path
+  \"/org/mpris/MediaPlayer2/TrackList/NoTrack\" indicates that
+  the track should be inserted at the start of the track list.
+
+- SET-AS-CURRENT indicates whether the newly inserted track
+  should be considered as the current track. Setting this to true
+  has the same effect as calling GoTo afterwards.
+
+If `mpris-can-edit-tracks' is false, this has no effect.
+
+Note: Clients should not assume that the track has been added at
+the time when this method returns. They should wait for a
+TrackAdded (or TrackListReplaced) signal.
+
+When ASYNC-HANDLER is set, the call is made asynchronously and the function
+called with the result.
+
+To use a specific player, set SERVICE to the target MediaPlayer2 service.
+
+If SERVICE is unset and no player exists, the symbol no-player is returned."
+  (if (mpris--player-interface-p (or service mpris-current-player) mpris--dbus-interface-tracklist)
+      (mpris--call-method async-handler service mpris--dbus-interface-tracklist
+                          "AddTrack" :string uri :object-path after-track-id :boolean set-as-current)
+    'unimplemented))
+
+(defun mpris-remove-track (track-id &optional async-handler service)
+  "Remove an item from the TrackList.
+
+- TRACK-ID is the identifier of the track to be removed.
+  \"/org/mpris/MediaPlayer2/TrackList/NoTrack\" is not a valid
+  value for this argument.
+
+If the track is not part of this tracklist, this has no effect.
+
+If the `mpris-can-edit-tracks' property is false, this has no effect.
+
+Note: Clients should not assume that the track has been removed
+at the time when this method returns. They should wait for a
+TrackRemoved (or TrackListReplaced) signal.
+
+When ASYNC-HANDLER is set, the call is made asynchronously and the function
+called with the result.
+
+To use a specific player, set SERVICE to the target MediaPlayer2 service.
+
+If SERVICE is unset and no player exists, the symbol no-player is returned."
+  (if (mpris--player-interface-p (or service mpris-current-player) mpris--dbus-interface-tracklist)
+      (mpris--call-method async-handler service mpris--dbus-interface-tracklist
+                          "RemoveTrack" :object-path track-id)
+    'unimplemented))
+
+(defun mpris-go-to-track (track-id &optional async-handler service)
+  "Skip to the specified TRACK-ID.
+
+- TRACK-ID is the identifier of the track to skip to.
+  \"/org/mpris/MediaPlayer2/TrackList/NoTrack\" is not a valid
+  value for this argument.
+
+If the track is not part of this tracklist, this has no effect.
+
+If this object is not \"/org/mpris/MediaPlayer2\", the current
+TrackList's tracks should be replaced with the contents of this
+TrackList, and the TrackListReplaced signal should be fired from
+\"/org/mpris/MediaPlayer2\".
+
+When ASYNC-HANDLER is set, the call is made asynchronously and the function
+called with the result.
+
+To use a specific player, set SERVICE to the target MediaPlayer2 service.
+
+If SERVICE is unset and no player exists, the symbol no-player is returned."
+  (if (mpris--player-interface-p (or service mpris-current-player) mpris--dbus-interface-tracklist)
+      (mpris--call-method async-handler service mpris--dbus-interface-tracklist
+                          "GoTo" :object-path track-id)
+    'unimplemented))
+
+;;;; MPRIS TrackList API - Properties
+
+(defun mpris-get-tracks (&optional async-handler service)
+  "Get each track in the current tracklist, in order.
+
+The org.freedesktop.DBus.Properties.PropertiesChanged signal is
+emited every time this property changes, but the signal message
+does not contain the new value. Client implementations should
+rather rely on the TrackAdded, TrackRemoved and TrackListReplaced
+signals to keep their representation of the tracklist up to date.
+
+When ASYNC-HANDLER is set, the call is made asynchronously and the function
+called with the result.
+
+To use a specific player, set SERVICE to the target MediaPlayer2 service.
+
+If SERVICE is unset and no player exists, the symbol no-player is returned."
+  (if (mpris--player-interface-p (or service mpris-current-player) mpris--dbus-interface-tracklist)
+      (mpris--get-property async-handler service mpris--dbus-interface-tracklist "Tracks")
+    'unimplemented))
+
+(defun mpris-can-edit-tracks (&optional async-handler service)
+  "Whether the track list can be edited.
+
+If false, calling `mpris-add-track' or `mpris-remove-track' will
+have no effect, and may raise a NotSupported error.
+
+When ASYNC-HANDLER is set, the call is made asynchronously and the function
+called with the result.
+
+To use a specific player, set SERVICE to the target MediaPlayer2 service.
+
+If SERVICE is unset and no player exists, the symbol no-player is returned."
+  (if (mpris--player-interface-p (or service mpris-current-player) mpris--dbus-interface-tracklist)
+      (mpris--get-property async-handler service mpris--dbus-interface-tracklist "")
+    'unimplemented))
+
+;;; MPRIS Playlists API
+;; Here we define all the method calls and property acessors
+;; listed in <https://specifications.freedesktop.org/mpris-spec/latest/Playlists_Interface.html>
+
+;;;; MPRIS Playlists API - Methods
+
+(defun mpris-activate-playlist (playlist-id &optional async-handler service)
+  "Start playing PLAYLIST-ID.
+
+It is up to the media player whether this completely replaces the
+current tracklist, or whether it is merely inserted into the
+tracklist and the first track starts. For example, if the media
+player is operating in a \"jukebox\" mode, it may just append the
+playlist to the list of upcoming tracks, and skip to the first
+track in the playlist.
+
+When ASYNC-HANDLER is set, the call is made asynchronously and the function
+called with the result.
+
+To use a specific player, set SERVICE to the target MediaPlayer2 service.
+
+If SERVICE is unset and no player exists, the symbol no-player is returned."
+  (if (mpris--player-interface-p (or service mpris-current-player) mpris--dbus-interface-playlists)
+      (mpris--call-method async-handler service mpris--dbus-interface-playlists
+                          "ActivatePlaylist" :object-path playlist-id)
+    'unimplemented))
+
+(defun mpris-get-playlists (index max-count order reverse-order &optional async-handler service)
+  "Get a set of playlists.
+
+- INDEX is the integer index of the first playlist to be
+  fetched (according to the ordering).
+
+- MAX-COUNT is the maximum number of playlists to fetch.
+
+- ORDER specifies the ordering that should be used, it should be one of
+  `mpris-get-orderings', usually:
+  - \"Alphabetical\"
+  - \"CreationDate\"
+  - \"ModifiedDate\"
+  - \"LastPlayDate\"
+  - \"UserDefined\"
+
+- REVERSE-ORDER specifies whether the order should be reversed.
+
+When ASYNC-HANDLER is set, the call is made asynchronously and the function
+called with the result.
+
+To use a specific player, set SERVICE to the target MediaPlayer2 service.
+
+If SERVICE is unset and no player exists, the symbol no-player is returned."
+  (if (mpris--player-interface-p (or service mpris-current-player) mpris--dbus-interface-playlists)
+      (mpris--call-method async-handler service mpris--dbus-interface-playlists
+                          "GetPlaylists" :int64 index :int64 max-count order :boolean reverse-order)
+    'unimplemented))
+
+;;;; MPRIS Playlists API - Properties
+
+(defun mpris-get-playlist-count (&optional async-handler service)
+  "The number of playlists available.
+
+When ASYNC-HANDLER is set, the call is made asynchronously and the function
+called with the result.
+
+To use a specific player, set SERVICE to the target MediaPlayer2 service.
+
+If SERVICE is unset and no player exists, the symbol no-player is returned."
+  (if (mpris--player-interface-p (or service mpris-current-player) mpris--dbus-interface-playlists)
+      (mpris--get-property async-handler service mpris--dbus-interface-playlists
+                           "PlaylistCount")
+    'unimplemented))
+
+(defun mpris-get-orderings (&optional async-handler service)
+  "The availible orderings.
+
+When ASYNC-HANDLER is set, the call is made asynchronously and the function
+called with the result.
+
+To use a specific player, set SERVICE to the target MediaPlayer2 service.
+
+If SERVICE is unset and no player exists, the symbol no-player is returned."
+  (if (mpris--player-interface-p (or service mpris-current-player) mpris--dbus-interface-playlists)
+      (mpris--get-property async-handler service mpris--dbus-interface-playlists
+                           "Orderings")
+    'unimplemented))
+
+(defun mpris-active-playlist (&optional async-handler service)
+  "The currently-active playlist.
+
+If there is no currently-active playlist, the structure's Valid
+field will be false, and the Playlist details are undefined.
+
+Note that this may not have a value even after ActivatePlaylist
+is called with a valid playlist id as ActivatePlaylist
+implementations have the option of simply inserting the contents
+of the playlist into the current tracklist.
+
+When ASYNC-HANDLER is set, the call is made asynchronously and the function
+called with the result.
+
+To use a specific player, set SERVICE to the target MediaPlayer2 service.
+
+If SERVICE is unset and no player exists, the symbol no-player is returned."
+  (if (mpris--player-interface-p (or service mpris-current-player) mpris--dbus-interface-playlists)
+      (mpris--get-property async-handler service mpris--dbus-interface-playlists
+                           "ActivePlaylist")
+    'unimplemented))
+
+;;; MPRIS Utility functions
 
 (defun mpris-track-attr (attr &optional service)
   "Attempt to determine ATTR of the current track.
@@ -1021,12 +1629,26 @@ To use a specific player, set SERVICE to the target MediaPlayer2 service."
            ((or 'file 'art-file)
             (lambda (v)
               (and (car v)
-                   (url-filename
-                    (url-generic-parse-url (car v))))))
+                   (mpris--uri-to-file (car v)))))
            (_ #'car)))
         (metadata (mpris-get-metadata nil service)))
     (and (not (eq metadata 'no-player))
          (funcall value-extractor (cadr (assoc key metadata))))))
+
+(defun mpris--uri-to-file (uri)
+  "Try to get a file path for the content referred to by URI."
+  (if (string-prefix-p "file://" uri)
+      (url-filename (url-generic-parse-url uri))
+    (let ((temp-file
+           (file-name-concat
+            temporary-file-directory
+            (file-name-with-extension
+             (concat "emacs-mpris-" (sha1 uri))
+             (file-name-extension uri)))))
+      (if (file-exists-p temp-file)
+          temp-file
+        (and (url-copy-file uri temp-file)
+             temp-file)))))
 
 (defun mpris--file-name-uri (f)
   "Return a URI for the filename F.
@@ -1049,21 +1671,6 @@ Used in `mpris--file-name-uri'"
          (mapcar (lambda (ch)
                    (format "%%%x%x" (/ ch 16) (% ch 16)))
                  (string-to-list str))))
-
-(defun mpris-open-file (file &optional async-handler service)
-  "Open FILE with the current player.
-
-A thin wrapper around `mpris-open-uri'.
-
-When ASYNC-HANDLER is set, the call is made asynchronously and the function
-called on completion with a single nil argument.
-
-To use a specific player, set SERVICE to the target MediaPlayer2 service.
-
-If SERVICE is unset and no player exists, the symbol no-player is returned."
-  (mpris-open-uri
-   (url-encode-url (mpris--file-name-uri file))
-   async-handler service))
 
 (provide 'mpris)
 ;;; mpris.el ends here
