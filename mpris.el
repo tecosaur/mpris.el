@@ -1657,7 +1657,7 @@ To use a specific player, set SERVICE to the target MediaPlayer2 service."
             temporary-file-directory
             (file-name-with-extension
              (concat "emacs-mpris-" (sha1 uri))
-             (file-name-extension uri)))))
+             (or (file-name-extension uri) "img")))))
       (if (file-exists-p temp-file)
           temp-file
         (and (url-copy-file uri temp-file)
