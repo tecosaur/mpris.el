@@ -453,9 +453,15 @@ This relies on active DBus watchers maintaining `mpris--active-players'
 and `mpris--player-states'."
   ;; If the current player exists and is playing, do nothing.
   (unless (and (member mpris-current-player mpris--active-players)
-               (equal "Playing" (mpris-get-playback-status)))
+               (equal "Playing" (mpris-get-playback-status))
+               (let (disliked-player-p)
+                 (dolist (player mpris-disliked-players)
+                   (when (string-prefix-p (concat "org.mpris.MediaPlayer2." player) mpris-current-player)
+                     (setq disliked-player-p t)))
+                 (not disliked-player-p)))
     (let ((candidate-services mpris--active-players)
           (previous-service mpris-current-player)
+          (service-sorter (lambda (a b) (> (cdr a) (cdr b))))
           preferred-services recent-services common-services disliked-services
           selected-service)
       ;; Process the candidate services into seperate priority lists.
@@ -467,15 +473,21 @@ and `mpris--player-states'."
           (unless name
             (setq name (substring service 23)))
           (cond
-           ((member name mpris-disliked-players)
-            (push service disliked-services))
            ((member service mpris--recent-players)
-            (push service recent-services))
+            (push (cons service (length (member service mpris--recent-players)))
+                  recent-services))
+           ((member name mpris-disliked-players)
+            (push (cons service (- (length (member name mpris-disliked-players))))
+                  disliked-services))
            ((member name mpris-preferred-players)
-            (push service preferred-services))
+            (push (cons service (length (member name mpris-preferred-players)))
+                  preferred-services))
            (t (push service common-services)))))
-      (setq preferred-services (nreverse preferred-services))
-      (setq recent-services (nreverse recent-services))
+      ;; This next bit might look weird, but we actually want the ordering of
+      ;; `mpris-disliked-players' and `mpris-preferred-players' to matter, and
+      (setq recent-services    (mapcar #'car (sort recent-services service-sorter)))
+      (setq preferred-services (mapcar #'car (sort preferred-services service-sorter)))
+      (setq disliked-services  (mapcar #'car (sort disliked-services service-sorter)))
       ;; First, look for playing services. With priority order:
       ;; 1. Preferred
       ;; 2. Recently played
@@ -501,8 +513,9 @@ and `mpris--player-states'."
       (setq mpris-current-player selected-service)
       ;; If we've selected a different player to the current one, a few things need updating.
       (unless (equal previous-service selected-service)
-        (setq mpris--recent-players (delete selected-service mpris--recent-players))
-        (push selected-service mpris--recent-players)
+        (when (equal "Playing" (mpris-get-playback-status nil selected-service))
+          (setq mpris--recent-players (delete selected-service mpris--recent-players))
+          (push selected-service mpris--recent-players))
         (run-hook-with-args 'mpris-current-player-change-hook
                             previous-service selected-service)
         (run-hook-with-args 'mpris-current-status-hook 'player selected-service)))))
